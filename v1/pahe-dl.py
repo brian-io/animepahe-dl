@@ -2,6 +2,7 @@
 """
 AnimePahe Downloader - Streamlined Implementation with Form Capture
 """
+import glob
 import os
 import re
 import ssl
@@ -25,7 +26,7 @@ from urllib3.poolmanager import PoolManager
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("anime_dl.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("logs/anime_dl.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -189,7 +190,7 @@ class AnimeDownloader:
         logger.info(f"Found {len(eps)} episodes")
         return eps
 
-    def _extract_download_links(self, episode_url, quality_pref=1080):
+    def _extract_download_links(self, episode_url, quality_pref=1080, prefer_dub=False):
         """Extract download links from episode page"""
         # logger.info(f"Extracting download links from: {episode_url}")
         
@@ -219,25 +220,71 @@ class AnimeDownloader:
             for link in download_menu.select("a.dropdown-item"):
                 text = link.text.strip()
                 href = link.get('href')
+
+                # Check if this is a dubbed version 
+                is_dub = 'badge-warning' in str(link) and 'eng' in str(link) or 'chi' in str(link)
+
                 
                 # Parse resolution from link text (e.g., "SubsPlease · 1080p (131MB)")
                 resolution_match = re.search(r'(\d+)p', text)
                 if resolution_match and href:
                     resolution = int(resolution_match.group(1))
-                    download_links[resolution] = href
+                    # Store both resolution and dub info
+                    key = (resolution, is_dub)
+                    download_links[key] = {
+                        'url': href,
+                        'text': text,
+                        'is_dub': is_dub
+                    }
             
-            logger.info(f"Found download options: {list(download_links.keys())}")
+            available_options = {
+                'subbed': [k for k in download_links.keys() if not k[1]],
+                'dubbed': [k for k in download_links.keys() if k[1]]
+            } 
+
+            # Log available options
+            logger.info(f"Available subbed qualities: {[r[0] for r in available_options['subbed']]}")
+            logger.info(f"Available dubbed qualities: {[r[0] for r in available_options['dubbed']]}")
+             
+             # First try to find preferred audio type
+            target_type = 'dubbed' if prefer_dub else 'subbed'
+            fallback_type = 'subbed' if prefer_dub else 'dubbed'
             
-            # Select preferred quality or best available
-            if quality_pref in download_links:
-                selected = quality_pref
-            else:
-                # Get closest available quality
-                available = sorted(download_links.keys())
-                selected = min(available, key=lambda x: abs(x - quality_pref))
-                logger.info(f"Selected closest quality: {selected}p")
+             # Try to get the preferred audio type first
+            if available_options[target_type]:
+                # Try to match the preferred quality
+                options = available_options[target_type]
+                resolutions = [r[0] for r in options]
                 
-            return download_links[selected]
+                if quality_pref in resolutions:
+                    selected_key = (quality_pref, prefer_dub)
+                else:
+                    # Get closest available quality
+                    closest_res = min(resolutions, key=lambda x: abs(x - quality_pref))
+                    selected_key = (closest_res, prefer_dub)
+                    logger.info(f"Selected closest quality: {closest_res}p ({target_type})")
+            
+            # Fall back to the other audio type if preferred isn't available
+            elif available_options[fallback_type]:
+                logger.info(f"Preferred {target_type} not available, falling back to {fallback_type}")
+                options = available_options[fallback_type]
+                resolutions = [r[0] for r in options]
+                
+                if quality_pref in resolutions:
+                    selected_key = (quality_pref, not prefer_dub)
+                else:
+                    # Get closest available quality
+                    closest_res = min(resolutions, key=lambda x: abs(x - quality_pref))
+                    selected_key = (closest_res, not prefer_dub)
+                    logger.info(f"Selected closest quality: {closest_res}p ({fallback_type})")
+            else:
+                logger.warning("No download options found")
+                return None
+                
+            selected_link = download_links[selected_key]
+            logger.info(f"Selected download option: {selected_link['text']}")
+            
+            return selected_link['url']
             
         except Exception as e:
             logger.error(f"Error extracting download links: {str(e)}")
@@ -524,13 +571,67 @@ class AnimeDownloader:
                         os.remove(path)
                     return False
         return False
+    
+    def _cleanup(self, directory=None):
+        """
+        Cleans up any partially downloaded .crdownload files in the specified directory.
+        """
+        
+        # Use the default download directory if none specified
+        if directory is None:
+            directory = self.dl_dir
+        
+        # logger.info(f"Cleaning up partial downloads in {directory}")        
+        try:
 
-    def download_episode(self, episode_url, output_path, quality_pref=1080):
+            processed_files = set()
+            
+            # Recursively search for .crdownload files in the directory and subdirectories
+            for root, _, _ in os.walk(directory):
+                crdownload_files = glob.glob(os.path.join(root, "*.crdownload"))
+                # Remove each .crdownload file
+                for file_path in crdownload_files:
+                    try:
+                       if file_path not in processed_files:
+                        # Ensure file isn't being written to (check if size changes)
+                        size_before = os.path.getsize(file_path)
+                        time.sleep(2)
+                        size_after = os.path.getsize(file_path)
+                        
+                        if size_before == size_after:  # File not being written to
+                            os.remove(file_path)
+                            logger.info(f"Removed Chrome partial download: {file_path}")
+                            count += 1
+                            processed_files.add(file_path)
+                        else:
+                            logger.info(f"Skipping active download: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove {file_path}: {str(e)}")
+                    
+                    # Remove Firefox's .part files
+                    # part_files = glob.glob(os.path.join(root, "*.part"))
+                    # for file_path in part_files:
+                    #     try:
+                    #         if file_path not in processed_files:
+                    #             os.remove(file_path)
+                    #             logger.info(f"Removed Firefox partial download: {file_path}")
+                    #             count += 1
+                    #             processed_files.add(file_path)
+                    #     except Exception as e:
+                    #         logger.error(f"Failed to remove {file_path}: {str(e)}")
+            # logger.info(f"Cleanup complete")
+            return None
+        
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            return 0
+
+    def download_episode(self, episode_url, output_path, quality_pref=1080, prefer_dub=False):
         """Process and download a single episode using form submission method"""
         logger.info(f"Processing episode: {episode_url}")
         
         # Step 1: Extract pahe.win download link from episode page
-        pahe_link = self._extract_download_links(episode_url, quality_pref)
+        pahe_link = self._extract_download_links(episode_url, quality_pref, prefer_dub)
         if not pahe_link:
             logger.error("Failed to extract download link from episode page")
             return False
@@ -548,10 +649,10 @@ class AnimeDownloader:
         # Step 3: Use the form submission method directly
         return self._handle_kwik_form_submission(kwik_link, output_path)
 
-    def download(self, anime_info, ep_range, quality):
+    def download(self, anime_info, ep_range, quality, prefer_dub=False):
         """Main download controller"""
         title, session_id = anime_info
-        logger.info(f"Starting download for: {title}")
+        logger.info(f"Starting download for: {title} ({'dubbed' if prefer_dub else 'subbed'})")
         
         eps = self.fetch_episodes(session_id, ep_range[0], ep_range[1])
         if not eps:
@@ -559,9 +660,10 @@ class AnimeDownloader:
             return
             
         sanitized = re.sub(r'[\\/*?:"<>|]', '', title)
+        audio_type = "DUB" if prefer_dub else "SUB"
         dl_dir = os.path.join(self.dl_dir, sanitized)
         os.makedirs(dl_dir, exist_ok=True)
-        logger.info(f"Output directory: {dl_dir}")
+        # logger.info(f"Output directory: {dl_dir}")
         
         success = 0
         for num, url in sorted(eps.items()):
@@ -573,13 +675,18 @@ class AnimeDownloader:
                 success += 1
                 continue
             
-            logger.info(f"Processing episode {num}/{len(eps)}")
-            if self.download_episode(url, path, quality):
+            logger.info(f"Processing episode {num}/{len(eps) + num}")
+            if self.download_episode(url, path, quality, prefer_dub):
                 success += 1
                 self._random_delay()
                 
         logger.info(f"Completed: {success}/{len(eps)} episodes downloaded")
         
+        # Clean up any partially downloaded files
+        self._cleanup(dl_dir)
+
+   
+            
     def __del__(self):
         """Clean up resources when the object is destroyed"""
         if self.driver is not None:
@@ -596,9 +703,11 @@ def main():
     parser.add_argument("-e", "--end", type=int, required=False, help="End episode")
     parser.add_argument("-q", "--quality", type=int, default=1080, help="Preferred quality (e.g., 1080, 720, 360)")
     parser.add_argument("-d", "--dir", default="downloads", help="Output directory")
+    parser.add_argument("--dub", action="store_true", help="Prefer dubbed version if available")
+
     args = parser.parse_args()
 
-    logger.info("=== Starting Anime Downloader ===")
+    logger.info("=== Starting Download ===")
     dl = AnimeDownloader(args.dir)
     
     try:
@@ -613,8 +722,9 @@ def main():
         logger.info(f"Selected title: {title}")
         
         # Start download
-        dl.download((title, session_id), (args.start, args.end), args.quality)
-        logger.info("=== Download process completed ===")
+        dl.download((title, session_id), (args.start, args.end), args.quality, args.dub)
+        logger.info("=== Download completed ===")
+
     finally:
         # Ensure browser is closed properly
          if dl.driver is not None:
